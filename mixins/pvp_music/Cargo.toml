@@ -1,0 +1,11 @@
+[package]
+name = "horizon-mod-pvp-music"
+version = "1.2.0"
+edition = "2024"
+license = "CC0-1.0"
+publish = false
+description = "Battle music during combat on Horizon: a Rust port of PvP Music."
+
+# The mod logic and its tests: the same file the bundle adds to the game.
+[lib]
+path = "runtime.rs"
