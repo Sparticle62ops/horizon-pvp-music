@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "pvp_music",
+  "version": "1.2.0",
+  "game": "26.3",
+  "horizon": "3fb4c3138e0c5d8fdd2fdb555cf31368e8897497",
+  "mixins": "d9c83d7096b7ea5b83678da2efdfd6161f74997e"
+}
