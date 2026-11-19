@@ -1,31 +1,23 @@
-// PVP Music for Horizon: battle music during combat.
-//
-// A Rust port of PvP Music (net.punchthecake.pvpmusic, Modrinth Tkf0xIjA,
-// CC0-1.0, https://modrinth.com/mod/pvp-music). The original's behavior is
-// kept: mutual-combat detection (attacks on and by players and mobs are
-// remembered for 5 s), the wither and explosion triggers, the fading battle
-// track with death fades, the phased two-half battle music switched at low
-// health on a beat, and the short and long end sounds queued when a battle
-// of 30 s or more ends. Horizon drives the settings with the /pvpmusic
-// command instead of the original's config screen.
-//
-// Where the client cannot see what the original read, this port degrades
-// the same way the original's own fallbacks do:
-// - The original waits for the attacked player's hurtTime after a landed
-//   hit; a landed hit on a player starts the battle here.
-// - The original reads the attacker off the damage source; the client hurt
-//   log carries only the damage type, so a mob-type hurt looks for a mob
-//   we recently attacked (the original's own 20-block fallback), then any
-//   mob within 10 blocks (the original's own 10-block fallback).
-// - The original starts a wither fight only with the Wither effect; the
-//   client surface here carries no per-effect read, so proximity alone
-//   triggers it.
+//! PVP Music for Horizon: battle music during combat.
+//!
+//! A Rust port of PvP Music (net.punchthecake.pvpmusic, Modrinth Tkf0xIjA,
+//! CC0-1.0, https://modrinth.com/mod/pvp-music). The original's behavior is
+//! kept: mutual-combat detection (attacks on and by players and mobs are
+//! remembered for 5 s), the wither and explosion triggers, the fading battle
+//! track with death fades, the phased two-half battle music switched at low
+//! health on a beat, and the short and long end sounds queued when a battle
+//! of 30 s or more ends. Horizon drives the settings with the /pvpmusic
+//! command instead of the original's config screen.
+//!
+//! The state machine reads a [`Snapshot`] the hooks gather from the mod API
+//! (see `lib.rs`). Where the client cannot see what the original read, this
+//! port degrades the same way the original's own fallbacks do, and each
+//! degradation is listed in the README with its tracking issue.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::music::Music;
+use mod_api::Music;
 
 /// The mod's id (its sound namespace and settings folder in the original).
 pub const ID: &str = "pvp_music";
@@ -95,7 +87,12 @@ impl Default for Config {
             short_end_threshold: 600,
             long_end_threshold: 1200,
             disabled_mobs: [
-                "silverfish", "endermite", "bee", "panda", "goat", "ender_dragon",
+                "silverfish",
+                "endermite",
+                "bee",
+                "panda",
+                "goat",
+                "ender_dragon",
             ]
             .iter()
             .map(|m| m.to_string())
@@ -149,7 +146,7 @@ struct PendingEnd {
 /// `PhasedBattleMusicController`, driven once a client tick from the music
 /// hook.
 pub struct Manager {
-    cfg: Config,
+    pub cfg: Config,
     current: Option<Battle>,
     potential_target: Option<(u32, Instant)>,
     recent_player_attacks: HashMap<u32, Instant>,
@@ -157,9 +154,15 @@ pub struct Manager {
     pending_end: Option<PendingEnd>,
     last_attack_seen: i64,
     last_hurt_seen: i64,
+    /// Attacks recorded by the attack-target hook since the last music tick.
+    attack_pending: Vec<AttackRecord>,
+    /// Hurts recorded by the tick hook since the last music tick.
+    hurt_pending: Vec<HurtRecord>,
     /// The latest max-health read (the music hook holds the game only
     /// immutably, so the tick hook keeps this fresh).
     max_health: f64,
+    /// The latest health read, for the tick hook's drop detection.
+    last_health: Option<f32>,
 }
 
 impl Default for Manager {
@@ -179,71 +182,101 @@ impl Manager {
             pending_end: None,
             last_attack_seen: i64::MIN,
             last_hurt_seen: i64::MIN,
+            attack_pending: Vec::new(),
+            hurt_pending: Vec::new(),
             max_health: 20.0,
+            last_health: None,
         }
     }
 
-    fn scale(&self, is_mob: bool) -> f32 {
-        (if is_mob {
-            self.cfg.volume
-        } else {
-            self.cfg.volume
-        } / 100.0) as f32
+    fn scale(&self, _is_mob: bool) -> f32 {
+        self.cfg.volume as f32 / 100.0
     }
 }
 
-/// The mod's state, shared by the hook helpers.
-pub static STATE: Mutex<Option<Manager>> = Mutex::new(None);
+/// What the client told us this tick, gathered by the hooks in `lib.rs`.
+pub struct PlayerFacts {
+    pub position: [f64; 3],
+    pub health: f32,
+}
 
-fn state() -> std::sync::MutexGuard<'static, Option<Manager>> {
+/// One mob near the player: its network id, type id, position and health.
+pub struct MobFacts {
+    pub id: u32,
+    pub kind: String,
+    pub position: [f64; 3],
+    pub health: f32,
+}
+
+/// One attack we landed, from the client attack-target hook.
+pub struct AttackRecord {
+    pub game_time: i64,
+    pub target: String,
+    pub id: u32,
+    pub landed: bool,
+}
+
+/// One hurt we took, from the client tick's health-drop detection.
+pub struct HurtRecord {
+    pub game_time: i64,
+    pub source: String,
+}
+
+/// The reads the state machine runs on, gathered fresh each music hook.
+pub struct Snapshot {
+    pub player: Option<PlayerFacts>,
+    pub mobs: Vec<MobFacts>,
+    pub attacks: Vec<AttackRecord>,
+    pub hurts: Vec<HurtRecord>,
+}
+
+/// The mod's state, shared by the hook helpers.
+pub static STATE: std::sync::Mutex<Option<Manager>> = std::sync::Mutex::new(None);
+
+pub fn state() -> std::sync::MutexGuard<'static, Option<Manager>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn dist3(
-    ax: f64,
-    ay: f64,
-    az: f64,
-    bx: f64,
-    by: f64,
-    bz: f64,
-) -> f64 {
+fn dist3(ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64) -> f64 {
     ((ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2)).sqrt()
 }
 
 /// Once a client tick, from the music hook: run the battle state machine,
 /// then set the track and its volume, or leave the game's own music when
 /// the battle is over.
-pub fn music_tick(game: &crate::game::Game<'_>, music: &mut Option<Music>, volume: &mut f32) {
+pub fn music_tick(snap: &Snapshot, music: &mut Option<Music>, volume: &mut f32) {
     let mut manager = state();
     let Some(manager) = manager.as_mut() else {
         *manager = Some(Manager::new());
         let manager = manager.as_mut().unwrap();
-        return drive(manager, game, music, volume);
+        return drive(manager, snap, music, volume);
     };
-    drive(manager, game, music, volume);
+    drive(manager, snap, music, volume);
 }
 
 fn drive(
     manager: &mut Manager,
-    game: &crate::game::Game<'_>,
+    snap: &Snapshot,
     music: &mut Option<Music>,
     volume: &mut f32,
 ) {
-    let Some(p) = game.player.as_ref() else {
+    let Some(p) = snap.player.as_ref() else {
         return;
     };
     let pos = p.position;
-    let health = p.health.health();
+    let health = p.health;
     let max = manager.max_health;
     let now = Instant::now();
-    let new_attacks: Vec<(i64, String, u32, bool)> = p
-        .attack_log
+    let _ = manager.take_attacks();
+    let _ = manager.take_hurts();
+    let new_attacks: Vec<(i64, String, u32, bool)> = snap
+        .attacks
         .iter()
         .filter(|r| r.game_time > manager.last_attack_seen)
         .map(|r| (r.game_time, r.target.clone(), r.id, r.landed))
         .collect();
-    let new_hurts: Vec<(i64, String)> = p
-        .hurt_log
+    let new_hurts: Vec<(i64, String)> = snap
+        .hurts
         .iter()
         .filter(|r| r.game_time > manager.last_hurt_seen)
         .map(|r| (r.game_time, r.source.clone()))
@@ -256,18 +289,28 @@ fn drive(
     }
     // The target and the mobs around us, read before the mutable half.
     let target_alive = playing_id
-        .map(|id| game.mobs.iter().any(|m| m.id == id && m.health > 0.0))
+        .map(|id| snap.mobs.iter().any(|m| m.id == id && m.health > 0.0))
         .unwrap_or(true);
-    let wither_near = game
-        .mobs
-        .iter()
-        .any(|m| m.kind.id.contains("wither") && dist3(m.position.x as f64, m.position.y as f64, m.position.z as f64, pos.x as f64, pos.y as f64, pos.z as f64) <= WITHER_RADIUS);
-    let nearby_mobs: Vec<(u32, String, f64)> = game
+    let wither_near = snap.mobs.iter().any(|m| {
+        m.kind.contains("wither") && dist3(m.position[0], m.position[1], m.position[2], pos[0], pos[1], pos[2]) <= WITHER_RADIUS
+    });
+    let nearby_mobs: Vec<(u32, String, f64)> = snap
         .mobs
         .iter()
         .filter_map(|m| {
-            let kind = m.kind.id.trim_start_matches("minecraft:").to_string();
-            Some((m.id, kind, dist3(m.position.x as f64, m.position.y as f64, m.position.z as f64, pos.x as f64, pos.y as f64, pos.z as f64)))
+            let kind = m.kind.trim_start_matches("minecraft:").to_string();
+            Some((
+                m.id,
+                kind,
+                dist3(
+                    m.position[0],
+                    m.position[1],
+                    m.position[2],
+                    pos[0],
+                    pos[1],
+                    pos[2],
+                ),
+            ))
         })
         .collect();
 
@@ -296,7 +339,11 @@ fn drive(
             if on_beat {
                 b.synced = true;
             }
-            if b.synced && on_beat && health > 0.0 && health as f64 / max <= manager.cfg.phase2_health_threshold {
+            if b.synced
+                && on_beat
+                && health > 0.0
+                && health as f64 / max <= manager.cfg.phase2_health_threshold
+            {
                 b.track = Track::SecondHalf;
                 b.ticks_played = 0;
             }
@@ -344,8 +391,7 @@ fn drive(
             manager.cfg.fade_in
         })
         .max(0.1);
-        let fade_in_progress =
-            (now.duration_since(b.started).as_secs_f64() / fade_in).min(1.0);
+        let fade_in_progress = (now.duration_since(b.started).as_secs_f64() / fade_in).min(1.0);
         let fade_out_progress = if b.death_fade {
             let base = if b.is_mob {
                 manager.cfg.mob_fade_out
@@ -367,12 +413,7 @@ fn drive(
             manager.current = None;
             *music = None;
         } else {
-            *music = Some(Music::new(
-                b.track.sound(),
-                0,
-                0,
-                true,
-            ));
+            *music = Some(Music::new(b.track.sound(), 0, 0, true));
             *volume = (fade_in_progress * fade_out_progress) as f32 * scale;
         }
     }
@@ -397,7 +438,10 @@ fn drive(
             }
             if source.contains("player") {
                 start_battle(manager, u32::MAX, false);
-            } else if source.contains("explosion") || source.contains("badRespawnPoint") || source.contains("bad_respawn_point") {
+            } else if source.contains("explosion")
+                || source.contains("badRespawnPoint")
+                || source.contains("bad_respawn_point")
+            {
                 let hit = nearby_mobs
                     .iter()
                     .find(|(_, _, d)| *d <= EXPLOSION_RADIUS)
@@ -409,14 +453,16 @@ fn drive(
                     .iter()
                     .find(|(id, kind, d)| {
                         *d <= MOB_RADIUS
-                            && remembered.get(id).is_some_and(|t| now.duration_since(*t).as_millis() < MUTUAL_MS)
+                            && remembered
+                                .get(id)
+                                .is_some_and(|t| now.duration_since(*t).as_millis() < MUTUAL_MS)
                             && !manager.cfg.disabled_mobs.contains(kind)
                     })
                     .map(|(id, _, _)| *id)
                     .or_else(|| {
                         nearby_mobs
                             .iter()
-                            .find(|(id, kind, d)| {
+                            .find(|(_id, kind, d)| {
                                 *d <= MOB_FALLBACK_RADIUS
                                     && !manager.cfg.disabled_mobs.contains(kind)
                             })
@@ -434,7 +480,7 @@ fn drive(
             start_battle(manager, u32::MAX, true);
         }
         // The open player attack confirms within 500 ms.
-        if let Some((id, at)) = manager.potential_target {
+        if let Some((_id, at)) = manager.potential_target {
             if now.duration_since(at).as_millis() > CONFIRM_MS {
                 manager.potential_target = None;
             }
@@ -467,96 +513,89 @@ fn start_battle(manager: &mut Manager, target: u32, is_mob: bool) {
         synced: false,
         death_fade: false,
         death_started: None,
-        target: if target == u32::MAX { None } else { Some(target) },
+        target: if target == u32::MAX {
+            None
+        } else {
+            Some(target)
+        },
     });
     manager.potential_target = None;
 }
 
-
-/// Once a tick, from the game-tick hook: play a queued end sound once the
-/// battle track has stopped (the original queues it the same way and plays
-/// it when the current sound ends).
-pub fn game_tick(game: &mut crate::game::Game<'_>) {
+/// Once a tick, from the client-tick hook: refresh the max-health read and
+/// play a queued end sound once the battle track has stopped (the original
+/// queues it the same way and plays it when the current sound ends). The
+/// caller performs the sound at the player's position.
+pub fn tick_end(player_near: bool) -> Option<bool> {
     let mut manager = state();
     let manager = manager.get_or_insert_with(Manager::new);
-    if let Some(p) = game.player.as_mut() {
-        manager.max_health = p.attribute("minecraft:max_health").unwrap_or(20.0);
-    }
     if manager.current.is_some() {
-        return;
+        return None;
     }
-    let Some(end) = manager.pending_end.take() else {
-        return;
-    };
-    if !game.native_window() {
+    let end = manager.pending_end.take()?;
+    if !player_near {
         manager.pending_end = Some(end);
-        return;
+        return None;
     }
-    let Some(p) = game.player.as_ref() else {
-        manager.pending_end = Some(end);
-        return;
-    };
-    let pos = [p.position.x as f64, p.position.y as f64, p.position.z as f64];
-    let sound = if end.short { SHORT_END } else { LONG_END };
-    let _ = game.native_play_local_sound(sound, pos, manager.scale(false), 1.0, 0);
+    Some(end.short)
 }
 
-/// `/pvpmusic`: the settings the original keeps in its config screen.
-pub fn command_entry(
-    game: &mut crate::game::Game<'_>,
-    command: &str,
-    ran: &mut bool,
-) {
-    let rest = command.trim();
-    let (head, args) = rest.split_once(' ').unwrap_or((rest, ""));
-    let head = head.trim_start_matches('/').to_lowercase();
-    if !HEADS.contains(&head.as_str()) {
-        return;
-    }
-    *ran = true;
+/// The latest health read, so the tick hook can spot a drop.
+pub fn health_dropped(current: f32) -> bool {
     let mut manager = state();
     let manager = manager.get_or_insert_with(Manager::new);
-    let mut parts = args.split_whitespace();
-    match parts.next().unwrap_or("status") {
-        "status" => {
-            game.native_chat(&format!(
-                "pvp_music: volume {} fadeout {}s fadein {}s deathfade {} mob {} mobfadeout {}s mobfadein {}s mobdeathfade {} phased {} beat {} threshold {} shortend {} longend {} disabled [{}]",
-                manager.cfg.volume as i64, manager.cfg.fade_out, manager.cfg.fade_in,
-                manager.cfg.death_fadeout_multiplier,
-                if manager.cfg.mob_battle { "on" } else { "off" },
-                manager.cfg.mob_fade_out, manager.cfg.mob_fade_in,
-                manager.cfg.mob_death_fadeout_multiplier,
-                if manager.cfg.phased { "on" } else { "off" },
-                manager.cfg.beat_divisor, manager.cfg.phase2_health_threshold,
-                manager.cfg.short_end_threshold, manager.cfg.long_end_threshold,
-                manager.cfg.disabled_mobs.join(", ")
-            ));
-        }
-        "volume" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.volume = v.clamp(0.0, 100.0); } }
-        "fadeout" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.fade_out = v.max(0.0); } }
-        "fadein" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.fade_in = v.max(0.0); } }
-        "deathfade" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.death_fadeout_multiplier = v.max(1.0); } }
-        "mob" => { manager.cfg.mob_battle = matches!(parts.next(), Some("on") | None); }
-        "mobfadeout" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.mob_fade_out = v.max(0.0); } }
-        "mobfadein" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.mob_fade_in = v.max(0.0); } }
-        "mobdeathfade" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.mob_death_fadeout_multiplier = v.max(1.0); } }
-        "beat" => { if let Some(v) = parts.next().and_then(|v| v.parse::<i32>().ok()) { manager.cfg.beat_divisor = v.max(1); } }
-        "threshold" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.phase2_health_threshold = v.clamp(0.0, 1.0); } }
-        "phase1" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.phase1_duration = v.max(1.0); } }
-        "phase2" => { if let Some(v) = parts.next().and_then(|v| v.parse::<f64>().ok()) { manager.cfg.phase2_duration = v.max(1.0); } }
-        "shortend" => { if let Some(v) = parts.next().and_then(|v| v.parse::<i64>().ok()) { manager.cfg.short_end_threshold = v; } }
-        "longend" => { if let Some(v) = parts.next().and_then(|v| v.parse::<i64>().ok()) { manager.cfg.long_end_threshold = v; } }
-        "disabled" => {
-            let (sub, mob) = (parts.next(), parts.next().map(|m| m.to_lowercase()));
-            if let (Some(sub), Some(mob)) = (sub, mob) {
-                match sub {
-                    "add" => { if !manager.cfg.disabled_mobs.contains(&mob) { manager.cfg.disabled_mobs.push(mob); } }
-                    "remove" => { manager.cfg.disabled_mobs.retain(|m| *m != mob); }
-                    _ => {}
-                }
-            }
-        }
-        _ => { game.native_chat(USAGE); }
+    let last = manager.last_health;
+    manager.last_health = Some(current);
+    last.is_some() && current < last.unwrap() - f32::EPSILON
+}
+
+/// Take the attacks and hurts the hooks recorded since the last music tick.
+pub fn drain_pending() -> (Vec<AttackRecord>, Vec<HurtRecord>) {
+    let mut manager = state();
+    let manager = manager.get_or_insert_with(Manager::new);
+    (manager.take_attacks(), manager.take_hurts())
+}
+
+/// The configured volume scale, for the end sound's loudness.
+pub fn volume_scale() -> f32 {
+    state()
+        .as_ref()
+        .map(|m| m.cfg.volume as f32 / 100.0)
+        .unwrap_or(0.5)
+}
+
+/// Feed the latest max-health read from the tick hook.
+pub fn set_max_health(value: f64) {
+    state().get_or_insert_with(Manager::new).max_health = value;
+}
+
+/// Record one landed client attack click (the attack-target hook).
+pub fn record_attack(game_time: i64, target: String, id: u32) {
+    let mut manager = state();
+    let manager = manager.get_or_insert_with(Manager::new);
+    manager.attack_pending.push(AttackRecord {
+        game_time,
+        target,
+        id,
+        landed: true,
+    });
+}
+
+/// Record one hurt (the client tick's health-drop detection).
+pub fn record_hurt(game_time: i64, source: String) {
+    let mut manager = state();
+    let manager = manager.get_or_insert_with(Manager::new);
+    manager.hurt_pending.push(HurtRecord { game_time, source });
+}
+
+impl Manager {
+    /// Attacks recorded since the last music tick, then cleared.
+    fn take_attacks(&mut self) -> Vec<AttackRecord> {
+        std::mem::take(&mut self.attack_pending)
+    }
+    /// Hurts recorded since the last music tick, then cleared.
+    fn take_hurts(&mut self) -> Vec<HurtRecord> {
+        std::mem::take(&mut self.hurt_pending)
     }
 }
 

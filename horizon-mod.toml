@@ -1,0 +1,15 @@
+id = "pvp_music"
+name = "PVP Music"
+version = "1.2.0"
+description = "Battle music during combat: mutual-combat detection, the wither and explosion triggers, the fading battle track with death fades, the phased two-half battle music and the short and long end sounds. A 1:1 Rust port of PvP Music (CC0-1.0); Horizon drives the settings with the /pvpmusic command."
+authors = ["sparticle"]
+license = "CC0-1.0"
+homepage = "https://github.com/Sparticle62ops/horizon-pvp-music"
+api = "0.2"
+side = "client"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "f00125f61f794aaa3d4e950d301f353b35b6ee3d"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
