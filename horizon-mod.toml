@@ -1,6 +1,6 @@
 id = "pvp_music"
 name = "PVP Music"
-version = "1.2.0"
+version = "1.2.1"
 description = "Battle music during combat: mutual-combat detection, the wither and explosion triggers, the fading battle track with death fades, the phased two-half battle music and the short and long end sounds. A 1:1 Rust port of PvP Music (CC0-1.0); Horizon drives the settings with the /pvpmusic command."
 authors = ["sparticle"]
 license = "CC0-1.0"

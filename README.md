@@ -32,7 +32,7 @@ pinned Horizon SDK (`api 0.2`, game 26.3).
   track has stopped (`SoundPlay::ui`).
 - `command` + `register_client_commands`: `/pvpmusic`, answered locally,
   shown as a chat line, and consumed so the game does not run it.
-- The battle tracks and end sounds ship as `assets/pvp_music/sounds/`
+- The battle tracks and end sounds ship as `assets/pvp_music/sounds/` (the index is `assets/pvp_music/sounds.json`)
   (the original's sound events, CC0-1.0).
 
 ## Horizon seams
